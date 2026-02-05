@@ -1,0 +1,441 @@
+*&---------------------------------------------------------------------*
+*& Report  ZMM_CONSUMPTION
+*&
+*&---------------------------------------------------------------------*
+*&
+*&
+*&---------------------------------------------------------------------*
+REPORT zmm_consumption.
+
+*----------------------------------------------------------------------*
+* Selection Screen
+*----------------------------------------------------------------------*
+SELECTION-SCREEN BEGIN OF BLOCK bl1 WITH FRAME TITLE text-bl1.
+  PARAMETERS: p_werks TYPE t001w-werks OBLIGATORY.
+  PARAMETERS: p_month TYPE isellist-month OBLIGATORY.
+SELECTION-SCREEN END OF BLOCK bl1.
+
+*----------------------------------------------------------------------*
+* Local Class Definition
+*----------------------------------------------------------------------*
+CLASS lcl_report DEFINITION.
+  PUBLIC SECTION.
+    METHODS: run.
+
+  PRIVATE SECTION.
+    TYPES: BEGIN OF ty_alv,
+             matnr          TYPE matnr,
+             maktx          TYPE maktx,
+             mtart          TYPE mtart,
+             begin_stock    TYPE i,
+             income         TYPE menge_d,
+             end_stock      TYPE i,
+             consumption    TYPE menge_d,
+             price          TYPE p LENGTH 8 DECIMALS 4,
+             mena           TYPE konwa,
+             meins          TYPE meins,
+             cena_kmen_dilu TYPE c LENGTH 1,
+           END OF ty_alv.
+
+    TYPES: BEGIN OF ty_income,
+             matnr TYPE matnr,
+             menge TYPE menge_d,
+           END OF ty_income.
+
+    DATA: mt_alv        TYPE TABLE OF ty_alv,
+          mv_begin_date TYPE datum,
+          mv_end_date   TYPE datum,
+          mv_date_prev  TYPE datum,
+          mv_plant_waers TYPE waers,
+          mv_spras      TYPE spras.
+
+    METHODS: initialization,
+             check_authorization,
+             get_data,
+             get_prices_optimized,
+             display_alv.
+
+    METHODS: on_link_click FOR EVENT link_click OF cl_salv_events_table
+      IMPORTING row column.
+ENDCLASS.
+
+*----------------------------------------------------------------------*
+* Local Class Implementation
+*----------------------------------------------------------------------*
+CLASS lcl_report IMPLEMENTATION.
+
+  METHOD run.
+    check_authorization( ).
+    initialization( ).
+    get_data( ).
+    get_prices_optimized( ).
+    display_alv( ).
+  ENDMETHOD.
+
+  METHOD check_authorization.
+    AUTHORITY-CHECK OBJECT 'M_MSEG_WMB'
+      ID 'WERKS' FIELD p_werks
+      ID 'ACTVT' FIELD '03'.
+    IF sy-subrc <> 0.
+      MESSAGE e000(oo) WITH 'Keine Berechtigung zum Lesen der Daten im Werk' p_werks.
+    ENDIF.
+
+    DATA(lv_len) = strlen( p_month ).
+    IF lv_len <> 6 OR p_month CN '0123456789' OR p_month+4(2) > 12 OR p_month+4(2) < 01.
+      MESSAGE e000(oo) WITH 'Invalid value of month' p_month 'use YYYYMM format'.
+    ENDIF.
+  ENDMETHOD.
+
+  METHOD initialization.
+    " Calculate dates
+    mv_begin_date = p_month && '01'.
+
+    CALL FUNCTION 'LAST_DAY_OF_MONTHS'
+      EXPORTING
+        day_in            = mv_begin_date
+      IMPORTING
+        last_day_of_month = mv_end_date.
+
+    mv_date_prev = mv_begin_date - 1.
+
+    " Get Plant Currency and Language
+    SELECT SINGLE t001~waers, t001~spras
+      FROM t001k
+      INNER JOIN t001 ON t001~bukrs = t001k~bukrs
+      WHERE t001k~bwkey = @p_werks
+      INTO (@mv_plant_waers, @mv_spras).
+  ENDMETHOD.
+
+  METHOD get_data.
+    " 1. Select Materials (ROH, ZVBU)
+    SELECT m~matnr, k~maktx, m~mtart, m~meins
+      FROM mara AS m
+      INNER JOIN marc AS c ON c~matnr = m~matnr
+      LEFT JOIN makt AS k ON k~matnr = m~matnr AND k~spras = @mv_spras
+      WHERE c~werks = @p_werks
+        AND m~mtart IN ('ROH', 'ZVBU')
+      INTO TABLE @DATA(lt_materials).
+
+    IF lt_materials IS INITIAL.
+      MESSAGE 'No materials selected for the given criteria.' TYPE 'S' DISPLAY LIKE 'E'.
+      RETURN.
+    ENDIF.
+
+    " 2. Prepare Ranges for Class Call
+    DATA: lr_matnr TYPE RANGE OF matnr,
+          lr_werks TYPE RANGE OF werks_d,
+          lr_budat TYPE RANGE OF budat.
+
+    lr_werks = VALUE #( ( sign = 'I' option = 'EQ' low = p_werks ) ).
+    lr_budat = VALUE #( ( sign = 'I' option = 'EQ' low = mv_date_prev )
+                        ( sign = 'I' option = 'EQ' low = mv_end_date ) ).
+
+    lr_matnr = VALUE #( FOR m IN lt_materials ( sign = 'I' option = 'EQ' low = m-matnr ) ).
+
+    " 3. Call Stock Class
+    DATA: lt_stock_total TYPE zcl_mm_stock_on_date=>lty_stock_total_t.
+
+    zcl_mm_stock_on_date=>get_stocks(
+      EXPORTING
+        i_matnr_range = lr_matnr
+        i_werks_range = lr_werks
+        i_budat_range = lr_budat
+      RECEIVING
+        et_stock      = lt_stock_total
+    ).
+
+    " 4. Get Income (Specific Movements)
+    " Optimized Aggregation in Database
+    SELECT matnr,
+           SUM( CASE WHEN shkzg = 'H' THEN menge * -1 ELSE menge END ) AS menge
+      FROM mseg
+      INTO TABLE @DATA(lt_income)
+      WHERE werks = @p_werks
+        AND matnr IN @lr_matnr
+        AND bwart IN ('101', '102', '411', '412', '543')
+        AND budat_mkpf BETWEEN @mv_begin_date AND @mv_end_date
+      GROUP BY matnr.
+
+    " 5. Build ALV Data
+    LOOP AT lt_materials INTO DATA(ls_mat).
+      DATA(ls_alv) = VALUE ty_alv(
+        matnr = ls_mat-matnr
+        maktx = ls_mat-maktx
+        mtart = ls_mat-mtart
+        meins = ls_mat-meins
+      ).
+
+      " Begin Stock (at mv_date_prev - End of previous month)
+      TRY.
+          ls_alv-begin_stock = lt_stock_total[ matnr = ls_mat-matnr budat = mv_date_prev ]-menge.
+        CATCH cx_sy_itab_line_not_found.
+          ls_alv-begin_stock = 0.
+      ENDTRY.
+
+      " End Stock (at mv_end_date - End of current month)
+      TRY.
+          ls_alv-end_stock = lt_stock_total[ matnr = ls_mat-matnr budat = mv_end_date ]-menge.
+        CATCH cx_sy_itab_line_not_found.
+          ls_alv-end_stock = 0.
+      ENDTRY.
+
+      " Income
+      TRY.
+          ls_alv-income = lt_income[ matnr = ls_mat-matnr ]-menge.
+        CATCH cx_sy_itab_line_not_found.
+          ls_alv-income = 0.
+      ENDTRY.
+
+      " Consumption Calculation
+      ls_alv-consumption = ls_alv-begin_stock - ls_alv-end_stock + ls_alv-income.
+
+      APPEND ls_alv TO mt_alv.
+    ENDLOOP.
+
+    SORT mt_alv BY meins.
+
+  ENDMETHOD.
+
+  METHOD get_prices_optimized.
+    IF mt_alv IS INITIAL. RETURN. ENDIF.
+
+    DATA: lt_matnr_rng TYPE RANGE OF matnr.
+    lt_matnr_rng = VALUE #( FOR a IN mt_alv ( sign = 'I' option = 'EQ' low = a-matnr ) ).
+
+    " 1. Fetch Contracts
+    SELECT h~ebeln, h~lifnr, i~matnr, i~meins
+      FROM ekko AS h
+      INNER JOIN ekpo AS i ON i~ebeln = h~ebeln
+      INNER JOIN lfa1 AS v ON v~lifnr = h~lifnr
+      INTO TABLE @DATA(lt_contracts)
+      WHERE h~ekorg = @p_werks
+        AND h~bsart = 'LPA'
+        AND i~loekz <> 'L'
+        AND i~pstyp = '0'
+        AND i~matnr IN @lt_matnr_rng.
+
+    DATA: lt_a016 TYPE TABLE OF a016,
+          lt_konp TYPE TABLE OF konp.
+
+    IF lt_contracts IS NOT INITIAL.
+      " 2. Fetch Validity (A016)
+      SELECT knumh, datbi, datab, evrtn
+        FROM a016
+        INTO TABLE @lt_a016
+        FOR ALL ENTRIES IN @lt_contracts
+        WHERE evrtn = @lt_contracts-ebeln
+          AND datbi >= @mv_begin_date
+          AND datab <= @mv_end_date.
+
+      IF lt_a016 IS NOT INITIAL.
+        " 3. Fetch Price Conditions (KONP)
+        SELECT knumh, kbetr, kpein, konwa
+          FROM konp
+          INTO TABLE @lt_konp
+          FOR ALL ENTRIES IN @lt_a016
+          WHERE knumh = @lt_a016-knumh
+            AND kschl = 'PB00'.
+      ENDIF.
+    ENDIF.
+
+    " 4. Fetch Fallback Prices (MBEW)
+    SELECT matnr, vprsv, peinh, stprs, verpr
+      FROM mbew
+      INTO TABLE @DATA(lt_mbew)
+      FOR ALL ENTRIES IN @mt_alv
+      WHERE matnr = @mt_alv-matnr
+        AND bwkey = @p_werks.
+
+    " 5. Calculate Price per Material
+    LOOP AT mt_alv ASSIGNING FIELD-SYMBOL(<alv>).
+      DATA: lv_price_sum TYPE p LENGTH 16 DECIMALS 4,
+            lv_count     TYPE i,
+            lv_currency  TYPE konwa.
+      CLEAR: lv_price_sum, lv_count, lv_currency.
+
+      LOOP AT lt_contracts INTO DATA(ls_con) WHERE matnr = <alv>-matnr.
+        LOOP AT lt_a016 INTO DATA(ls_valid) WHERE evrtn = ls_con-ebeln.
+          LOOP AT lt_konp INTO DATA(ls_cond) WHERE knumh = ls_valid-knumh.
+            IF ls_cond-kpein IS NOT INITIAL.
+              lv_price_sum = lv_price_sum + ( ls_cond-kbetr / ls_cond-kpein ).
+            ELSE.
+              lv_price_sum = lv_price_sum + ls_cond-kbetr.
+            ENDIF.
+            lv_currency = ls_cond-konwa.
+            lv_count = lv_count + 1.
+          ENDLOOP.
+        ENDLOOP.
+      ENDLOOP.
+
+      IF lv_count > 0.
+        <alv>-price = lv_price_sum / lv_count.
+        <alv>-mena = lv_currency.
+      ELSE.
+        " Use Fallback
+        READ TABLE lt_mbew INTO DATA(ls_mbew) WITH KEY matnr = <alv>-matnr.
+        IF sy-subrc = 0 AND ls_mbew-peinh <> 0.
+          IF ls_mbew-vprsv = 'S'.
+            <alv>-price = ls_mbew-stprs / ls_mbew-peinh.
+          ELSE.
+            <alv>-price = ls_mbew-verpr / ls_mbew-peinh.
+          ENDIF.
+          <alv>-mena = 'CZK'. " Maintained legacy hardcode
+          <alv>-cena_kmen_dilu = 'X'.
+        ENDIF.
+      ENDIF.
+    ENDLOOP.
+
+  ENDMETHOD.
+
+  METHOD display_alv.
+    DATA: lo_salv TYPE REF TO cl_salv_table.
+
+    TRY.
+        cl_salv_table=>factory(
+          IMPORTING r_salv_table = lo_salv
+          CHANGING  t_table      = mt_alv ).
+
+        " Enable Generic Functions
+        DATA(lo_funcs) = lo_salv->get_functions( ).
+        lo_funcs->set_all( abap_true ).
+
+        " Setup Columns
+        DATA(lo_cols) = lo_salv->get_columns( ).
+        lo_cols->set_optimize( abap_true ).
+
+        " -- Hotspot for Material --
+        TRY.
+            DATA(lo_col_mat) = CAST cl_salv_column_table( lo_cols->get_column( 'MATNR' ) ).
+            lo_col_mat->set_cell_type( if_salv_c_cell_type=>hotspot ).
+          CATCH cx_salv_not_found.
+        ENDTRY.
+
+        " -- Hotspot for Income --
+        TRY.
+            DATA(lo_col_inc) = CAST cl_salv_column_table( lo_cols->get_column( 'INCOME' ) ).
+            lo_col_inc->set_cell_type( if_salv_c_cell_type=>hotspot ).
+            lo_col_inc->set_long_text( 'Income' ).
+          CATCH cx_salv_not_found.
+        ENDTRY.
+
+        " Column Headers
+        TRY.
+           lo_cols->get_column( 'BEGIN_STOCK' )->set_long_text( 'Begin Stock' ).
+           lo_cols->get_column( 'END_STOCK' )->set_long_text( 'End Stock' ).
+           lo_cols->get_column( 'CONSUMPTION' )->set_long_text( 'Consumption' ).
+           lo_cols->get_column( 'PRICE' )->set_long_text( 'Price' ).
+           lo_cols->get_column( 'MENA' )->set_long_text( 'Currency' ).
+           lo_cols->get_column( 'CENA_KMEN_DILU' )->set_long_text( 'Price from MM03' ).
+        CATCH cx_salv_not_found.
+        ENDTRY.
+
+
+        " Event Handling
+        DATA(lo_events) = lo_salv->get_event( ).
+        SET HANDLER on_link_click FOR lo_events.
+
+        " Top of List Header (Recreating original summary logic)
+        DATA: lo_header TYPE REF TO cl_salv_form_layout_grid,
+              lo_flow   TYPE REF TO cl_salv_form_layout_flow.
+
+        CREATE OBJECT lo_header.
+
+        " Get unique UoMs for Summary
+        DATA: lt_meins TYPE SORTED TABLE OF meins WITH UNIQUE KEY table_line.
+        LOOP AT mt_alv INTO DATA(ls_row).
+          INSERT ls_row-meins INTO TABLE lt_meins.
+        ENDLOOP.
+
+        " Rows labels
+        lo_flow = lo_header->create_flow( row = 2  column = 1 ).
+        lo_flow->create_text( text = 'ROH' ).
+        lo_flow = lo_header->create_flow( row = 3  column = 1 ).
+        lo_flow->create_text( text = 'ZVBU' ).
+
+        DATA(lv_col) = 1.
+        LOOP AT lt_meins INTO DATA(lv_meins).
+           lv_col = lv_col + 1.
+
+           " Header UoM
+           lo_flow = lo_header->create_flow( row = 1  column = lv_col ).
+           lo_flow->create_text( text = lv_meins ).
+
+           " Sum ROH
+           DATA(lv_sum_roh) = REDUCE menge_d( INIT s = 0 FOR m IN mt_alv
+                                              WHERE ( mtart = 'ROH' AND meins = lv_meins )
+                                              NEXT s = s + m-consumption ).
+           lo_flow = lo_header->create_flow( row = 2  column = lv_col ).
+           lo_flow->create_text( text = |{ lv_sum_roh }| ).
+
+           " Sum ZVBU
+           DATA(lv_sum_zvbu) = REDUCE menge_d( INIT s = 0 FOR m IN mt_alv
+                                               WHERE ( mtart = 'ZVBU' AND meins = lv_meins )
+                                               NEXT s = s + m-consumption ).
+           lo_flow = lo_header->create_flow( row = 3  column = lv_col ).
+           lo_flow->create_text( text = |{ lv_sum_zvbu }| ).
+        ENDLOOP.
+
+        lo_salv->set_top_of_list( lo_header ).
+        lo_salv->set_top_of_list_print( lo_header ).
+
+        lo_salv->display( ).
+
+      CATCH cx_salv_msg.
+        MESSAGE 'ALV Display Error' TYPE 'E'.
+    ENDTRY.
+  ENDMETHOD.
+
+  METHOD on_link_click.
+    READ TABLE mt_alv INTO DATA(ls_row) INDEX row.
+    CHECK sy-subrc = 0.
+
+    CASE column.
+      WHEN 'MATNR'.
+        SET PARAMETER ID 'MAT' FIELD ls_row-matnr.
+        SET PARAMETER ID 'WRK' FIELD p_werks.
+        CALL TRANSACTION 'MM03' AND SKIP FIRST SCREEN.
+
+      WHEN 'INCOME'.
+        " Navigate to MB51 (Material Document List)
+        DATA: lt_bwart_rng TYPE RANGE OF bwart.
+        lt_bwart_rng = VALUE #(
+          ( sign = 'I' option = 'EQ' low = '101' )
+          ( sign = 'I' option = 'EQ' low = '102' )
+          ( sign = 'I' option = 'EQ' low = '411' )
+          ( sign = 'I' option = 'EQ' low = '412' )
+          ( sign = 'I' option = 'EQ' low = '543' )
+        ).
+
+        SUBMIT rm07docs
+          WITH matnr EQ ls_row-matnr
+          WITH werks EQ p_werks
+          WITH budat-low EQ mv_begin_date
+          WITH budat-high EQ mv_end_date
+          WITH bwart IN lt_bwart_rng
+          AND RETURN.
+    ENDCASE.
+  ENDMETHOD.
+
+ENDCLASS.
+
+*----------------------------------------------------------------------*
+* Start of Selection
+*----------------------------------------------------------------------*
+START-OF-SELECTION.
+  DATA(lo_app) = NEW lcl_report( ).
+  lo_app->run( ).
+
+*----------------------------------------------------------------------*
+* AT SELECTION-SCREEN ON VALUE-REQUEST
+*----------------------------------------------------------------------*
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_month.
+  CALL FUNCTION 'POPUP_TO_SELECT_MONTH'
+    EXPORTING
+      actual_month               = sy-datum(6)
+    IMPORTING
+      selected_month             = p_month
+    EXCEPTIONS
+      factory_calendar_not_found = 1
+      holiday_calendar_not_found = 2
+      month_not_found            = 3
+      OTHERS                     = 4.
