@@ -1,0 +1,390 @@
+*&---------------------------------------------------------------------*
+*& Report  ZMM_CONSUMPTION
+*&
+*&---------------------------------------------------------------------*
+*&
+*&
+*&---------------------------------------------------------------------*
+
+report  zmm_consumption.
+
+types: begin of t_alv_final,
+          matnr type matnr,
+          maktx type maktx,
+          mtart type mtart,
+          begin_stock type i,
+          income type menge_d,
+          end_stock type i,
+          consumption type menge_d,
+          price type p decimals 4,
+          mena type konwa,
+          meins type meins,
+          cena_kmen_dilu type c,
+       end of t_alv_final.
+
+types: begin of t_meins,
+             meins type meins,
+       end of t_meins.
+
+  types: begin of t_prices, "tabulka nakupnich planu
+            matnr type matnr,
+            bismt type bismt,
+            maktx type maktx,
+            vendor type lifnr,
+            vendor_name type name1_gp,
+            schedule_agr type ebeln,
+            valid_from type kodatab,
+            valid_to type kodatbi,
+            price type p decimals 4,
+            mena type konwa,
+            meins type meins,
+        end of t_prices.
+
+types: begin of t_movements,
+          matnr type matnr,
+          bwart type bwart,
+          shkzg type shkzg,
+          menge type menge_d,
+       end of t_movements.
+
+data: gs_alv_final type t_alv_final, gt_alv_final type table of t_alv_final, gt_movements2 type table of t_movements, gs_movements2 type t_movements.
+data: gs_movements type t_movements, gt_movements type table of t_movements.
+data: gt_prices type table of t_prices.
+data: gt_meins type TABLE OF t_meins, gs_meins type t_meins.
+data: end_date type kodatab, begin_date type kodatab.
+data: int type i.
+data: gr_table   type ref to cl_salv_table.
+field-symbols: <gs_alv_final> type t_alv_final,<gs_movements> type t_movements, <gs_movements2> type t_movements, <gs_meins> type t_meins.
+
+data: gv_suma type menge_d.
+data: gv_plant_waers type waers, gv_spras(2) type c. "mena a jazyk vybraneho zavodu
+
+selection-screen begin of block bl1 with frame.
+  parameters: p_werks type t001w-werks obligatory.
+  parameters: p_month type isellist-month obligatory.
+selection-screen end of block bl1.
+***********************************************************************
+*              AT SELECTION-SCREEN
+***********************************************************************
+at selection-screen.
+
+  authority-check object 'M_MSEG_WMB'
+             id 'WERKS' field p_werks
+             id 'ACTVT' field '03'.
+  if sy-subrc <> 0.
+    message e000(oo) with
+    'Keine Berechtigung zum Lesen der Daten im Werk' p_werks.
+    exit.
+  endif.
+  int = strlen( p_month ).
+  if int <> 5  and ( p_month cn '0123456789' or
+     p_month+4(2) > 12 or
+     p_month+4(2) < 1 ).
+
+    message e000(oo) with
+    'Invalid value of month' p_month 'use RRRRMM format'.
+    exit.
+
+  endif.
+  " p_year = p_month+0(4).
+
+start-of-selection.
+  data: gv_begin_date type d, gv_end_date type d.
+  concatenate p_month '01' into gv_begin_date.
+  call function 'LAST_DAY_OF_MONTHS'
+    exporting
+      day_in            = gv_begin_date
+    importing
+      last_day_of_month = gv_end_date.
+
+
+  select t001~waers t001~spras into (gv_plant_waers,gv_spras)  from t001k inner join t001 on t001~bukrs = t001k~bukrs where t001k~bwkey = p_werks. "zjisteni meny zavody a dopsani do hlavicky
+  endselect.
+
+  select mara~matnr mara~mtart makt~maktx "seznam dilu s popisy to gt_alv_final
+   into corresponding fields of table gt_alv_final from mara
+        inner join marc on marc~matnr = mara~matnr
+        inner join makt on ( makt~matnr = mara~matnr )
+   where marc~werks = p_werks and mara~mtart in ('ROH','ZVBU') and makt~spras = gv_spras.
+    "and mara~matnr = '000000000031301006'
+
+  perform month_prices.
+  perform movements using p_werks. "natazeni pohybu 711 & 712
+  perform get_prices.
+  sort gt_alv_final by meins ASCENDING.
+
+  data: lv_meins type meins.
+  loop at gt_alv_final ASSIGNING <gs_alv_final>.
+    if <gs_alv_final>-meins <> lv_meins.
+      gs_meins-meins = <gs_alv_final>-meins.
+      APPEND gs_meins to gt_meins.
+    endif.
+    lv_meins = <gs_alv_final>-meins.
+  endloop.
+
+
+    call function 'ZREPLOG'
+    exporting
+      p_werks       = p_werks.
+
+  perform alv_display.
+
+*&---------------------------------------------------------------------*
+*&      Form  movements
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*      -->I_WERKS    text
+*----------------------------------------------------------------------*
+form movements using  i_werks type t001w-werks.
+  data: lv_lbkum type lbkum.
+
+  select mseg~matnr mseg~bwart mseg~shkzg mseg~menge into corresponding fields of table gt_movements from  mseg
+        where mseg~werks = i_werks and mseg~bwart in ('101','102','411','412','543')  and mseg~budat_mkpf BETWEEN gv_begin_date and gv_end_date. "'20130619'.
+    "and mseg~matnr = '000000000031301006'
+  gv_end_date = gv_end_date + 1.
+  loop at gt_movements assigning <gs_movements>.
+    if <gs_movements>-shkzg = 'H'. <gs_movements>-menge = <gs_movements>-menge * -1. endif.
+  endloop.
+  sort gt_movements by matnr ascending.
+
+  loop at gt_movements assigning <gs_movements>.
+    move-corresponding <gs_movements> to gs_movements.
+    gs_movements-bwart = ''. gs_movements-shkzg = ''.
+    collect gs_movements into gt_movements2.
+  endloop.
+
+* PLNENÍ ALV TABULKY
+  loop at gt_alv_final assigning <gs_alv_final>.
+    clear lv_lbkum.
+    select lbkum from zmbew into lv_lbkum "počáteční stav
+      where bwkey = i_werks and dat = gv_begin_date and matnr = <gs_alv_final>-matnr.
+    endselect.
+    <gs_alv_final>-begin_stock = lv_lbkum.
+
+    clear lv_lbkum.
+    select lbkum from zmbew into lv_lbkum "konečný stav
+      where bwkey = i_werks and dat = gv_end_date and matnr = <gs_alv_final>-matnr.
+    endselect.
+    <gs_alv_final>-end_stock = lv_lbkum.
+
+    loop at gt_movements2 assigning <gs_movements2> where matnr = <gs_alv_final>-matnr. "prijem z gt_movements2
+      <gs_alv_final>-income = <gs_movements2>-menge.
+    endloop.
+
+    <gs_alv_final>-consumption =  <gs_alv_final>-begin_stock - <gs_alv_final>-end_stock + <gs_alv_final>-income. "výpočet spotřeby
+  endloop.
+endform.                    "suma
+
+
+*&---------------------------------------------------------------------*
+*&      Form  month_prices
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+form month_prices.
+
+  types: begin of t_moje_ekko,
+           schedule_agr type ebeln,
+           vendor type lifnr,
+           vendor_name type name1_gp,
+           matnr type matnr,
+           meins type meins,
+       end of t_moje_ekko.
+  types: begin of t_moje_a016,
+           valid_to type kodatbi,
+           valid_from type kodatab,
+           condition_n type knumh,
+           schedule_agr type ebeln,
+      end of t_moje_a016.
+  types: begin of t_moje_konp,
+           condition_n type knumh,
+           price type kbetr_kond,
+           baze type kpein,
+           mena type konwa,
+      end of t_moje_konp.
+  data: gt_ekko type table of t_moje_ekko, gt_a016 type table of t_moje_a016, gt_konp type table of t_moje_konp, gs_prices type t_prices.
+  field-symbols: <gs_moje_ekko> type t_moje_ekko, <gs_moje_a016> type t_moje_a016, <gs_moje_konp> type t_moje_konp.
+
+  select ekko~ebeln ekko~lifnr lfa1~name1 ekpo~matnr ekpo~meins into table gt_ekko from ekko join ekpo on ekpo~ebeln = ekko~ebeln join lfa1 on lfa1~lifnr = ekko~lifnr where ekorg = p_werks and bsart = 'LPA' and ekpo~loekz <> 'L' and ekpo~pstyp = '0'.
+  select a016~datbi a016~datab a016~knumh a016~evrtn into table gt_a016 from a016 where evrtn like '55%' and datbi >= gv_begin_date and datab <= gv_end_date.
+  select konp~knumh konp~kbetr konp~kpein konp~konwa  into table gt_konp from konp where kschl = 'PB00'.
+
+  loop at gt_ekko assigning <gs_moje_ekko>.
+    gs_prices-vendor = <gs_moje_ekko>-vendor. gs_prices-vendor_name = <gs_moje_ekko>-vendor_name.
+    gs_prices-matnr = <gs_moje_ekko>-matnr. gs_prices-schedule_agr = <gs_moje_ekko>-schedule_agr.
+    gs_prices-meins = <gs_moje_ekko>-meins."plneni hlavni tabulky
+    loop at gt_a016 assigning <gs_moje_a016> where schedule_agr = <gs_moje_ekko>-schedule_agr.
+      gs_prices-valid_from = <gs_moje_a016>-valid_from. gs_prices-valid_to = <gs_moje_a016>-valid_to. "plneni hlavni tabulky
+      loop at gt_konp assigning <gs_moje_konp> where condition_n = <gs_moje_a016>-condition_n.
+        gs_prices-price = <gs_moje_konp>-price / <gs_moje_konp>-baze. gs_prices-mena = <gs_moje_konp>-mena. "plneni hlavni tabulky
+      endloop.
+    endloop.
+
+    append gs_prices to gt_prices.
+  endloop.
+  sort gt_prices by matnr ascending.
+endform.                    "month_prices
+
+*&---------------------------------------------------------------------*
+*&      Form  alv_display
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+form alv_display.
+  data: lr_functions type ref to cl_salv_functions_list.
+  data: lr_layout type ref to cl_salv_layout,
+        ls_layout_key type salv_s_layout_key.
+  data: lr_columns type ref to cl_salv_columns_table,
+        lr_column  type ref to cl_salv_column_table.
+  data: lr_header  type ref to cl_salv_form_layout_grid,
+        lr_h_label type ref to cl_salv_form_label,
+        lr_h_flow  type ref to cl_salv_form_layout_flow.
+* ---create ALV table
+
+  try.
+      cl_salv_table=>factory(
+        importing
+          r_salv_table = gr_table
+        changing
+          t_table      = gt_alv_final ).
+    catch cx_salv_msg.                                  "#EC NO_HANDLER
+  endtry.
+
+  create object lr_header.
+  lr_columns = gr_table->get_columns( ).
+  " lr_columns->set_optimize( 'X' ).
+
+* ---activate ALV generic functions
+  lr_functions = gr_table->get_functions( ).
+  lr_functions->set_default( abap_true ).
+  lr_functions->set_all( abap_true ).
+* ---activate layout functions
+  lr_layout = gr_table->get_layout( ).
+  ls_layout_key-report = sy-repid.
+  lr_layout->set_key( ls_layout_key ).
+  lr_layout->set_save_restriction( if_salv_c_layout=>restrict_none ).
+  lr_layout->set_default( abap_true ).
+
+  data: counter type i, quantity type string.
+  counter = 1.
+  lr_h_flow = lr_header->create_flow( row = 2  column = 1 ).
+  lr_h_flow->create_text( text = 'ROH' ).
+  lr_h_flow = lr_header->create_flow( row = 3  column = 1 ).
+  lr_h_flow->create_text( text = 'ZVBU' ).
+
+  loop at gt_meins assigning <gs_meins>. "soucet mernych jednotek pro ROH a ZVBU
+    counter = counter + 1. quantity = 0.
+    lr_h_flow = lr_header->create_flow( row = 1  column = counter ).
+    lr_h_flow->create_text( text = <gs_meins>-meins ).
+    quantity = 0.
+    loop at gt_alv_final ASSIGNING <gs_alv_final> where mtart = 'ROH' and meins = <gs_meins>-meins.
+      quantity = quantity + <gs_alv_final>-consumption.
+    endloop.
+    lr_h_flow = lr_header->create_flow( row = 2  column = counter ).
+    lr_h_flow->create_text( text = quantity ).
+    quantity = 0.
+    loop at gt_alv_final ASSIGNING <gs_alv_final> where mtart = 'ZVBU' and meins = <gs_meins>-meins.
+      quantity = quantity + <gs_alv_final>-consumption.
+    endloop.
+    lr_h_flow = lr_header->create_flow( row = 3  column = counter ).
+    lr_h_flow->create_text( text = quantity ).
+  endloop.
+
+* set the top of list using the header for Online.
+  gr_table->set_top_of_list( lr_header ).
+  gr_table->set_top_of_list_print( lr_header ).
+
+  try.
+      lr_column ?= lr_columns->get_column('BEGIN_STOCK').
+      lr_column->set_long_text( 'Begin stock'(001) ).
+      lr_column->set_medium_text( 'Begin stock'(001) ).
+      lr_column ?= lr_columns->get_column( 'END_STOCK').
+      lr_column->set_long_text( 'End stock'(002) ).
+      lr_column->set_medium_text( 'End stock'(002) ).
+      lr_column ?= lr_columns->get_column( 'INCOME').
+      lr_column->set_long_text( 'Income'(004) ).
+      lr_column->set_medium_text( 'Income'(004) ).
+      lr_column->set_short_text( 'Income'(004) ).
+      lr_column ?= lr_columns->get_column( 'CONSUMPTION').
+      lr_column->set_long_text( 'Consumption'(003) ).
+      lr_column->set_medium_text( 'Consumption'(003) ).
+      lr_column ?= lr_columns->get_column( 'PRICE').
+      lr_column->set_long_text( 'Price'(005) ).
+      lr_column->set_medium_text( 'Price'(005) ).
+      lr_column ?= lr_columns->get_column( 'MENA').
+      lr_column->set_long_text( 'Currency'(006) ).
+      lr_column->set_medium_text( 'Currency'(006) ).
+      lr_column->SET_OUTPUT_LENGTH( 9 ).
+      lr_column ?= lr_columns->get_column( 'CENA_KMEN_DILU').
+      lr_column->set_long_text( 'Price from MM03'(007) ).
+      lr_column->set_medium_text( 'Price from MM03'(007) ).
+      lr_column->SET_OUTPUT_LENGTH( 16 ).
+    catch cx_salv_not_found.
+  endtry.
+
+* --- display the table
+  gr_table->display( ).
+
+endform.                    "alv_display
+
+*&---------------------------------------------------------------------*
+*&      At Selection Screen Event
+*&---------------------------------------------------------------------*
+at selection-screen on value-request for p_month.
+
+  call function 'POPUP_TO_SELECT_MONTH'
+    exporting
+      actual_month               = sy-datum(6)
+    importing
+      selected_month             = p_month
+    exceptions
+      factory_calendar_not_found = 1
+      holiday_calendar_not_found = 2
+      month_not_found            = 3
+      others                     = 4.
+  if sy-subrc <> 0.
+    message id sy-msgid type sy-msgty number sy-msgno
+            with sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  endif.
+
+form GET_PRICES .
+  data:lv_vprsv type mbew-vprsv, lv_meins type meins,
+     lv_peinh type mbew-peinh, "Báze množství
+     lv_stprs type mbew-stprs, "standard cena
+     lv_verpr type mbew-verpr. "variabil cena
+
+  data: lv_price type  p decimals 4, lv_mena type konwa, lv_counter type i.
+  FIELD-SYMBOLS: <gs_prices> type t_prices.
+  loop at gt_alv_final ASSIGNING <gs_alv_final>.
+     clear lv_price. clear lv_counter. clear lv_mena.
+     loop at gt_prices ASSIGNING <gs_prices> where matnr = <gs_alv_final>-matnr.
+       lv_price = lv_price + <gs_prices>-price. lv_mena = <gs_prices>-mena.
+       lv_counter = lv_counter + 1.
+     endloop.
+     <gs_alv_final>-price = lv_price / lv_counter.
+     <gs_alv_final>-mena = lv_mena.
+     if lv_counter = 0.
+         select mbew~vprsv mbew~peinh mbew~stprs mbew~verpr
+           from mbew into (lv_vprsv, lv_peinh, lv_stprs, lv_verpr)
+           where mbew~matnr = <gs_alv_final>-matnr.
+         endselect.
+         case lv_vprsv. " ocenení
+             when 'S'. " standardni cena
+               <gs_alv_final>-price =  ( lv_stprs / lv_peinh ).
+             when 'V'. " variabilni cena
+               <gs_alv_final>-price =  ( lv_verpr / lv_peinh ).
+         endcase.
+         <gs_alv_final>-mena = 'CZK'.
+         <gs_alv_final>-cena_kmen_dilu = 'X'.
+     endif.
+
+    select mara~meins from mara
+          inner join marc on marc~matnr = mara~matnr
+          into lv_meins
+    where marc~werks = p_werks and mara~matnr = <gs_alv_final>-matnr.
+    <gs_alv_final>-meins = lv_meins.
+    ENDSELECT.
+
+  endloop.
+endform.                    " GET_PRICES
